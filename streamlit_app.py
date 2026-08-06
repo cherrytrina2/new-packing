@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import io
 import zipfile
@@ -11,6 +11,10 @@ import streamlit as st
 
 from pack_planner import (
     DEFAULT_SIZE_SAFETY_MARGIN_MM,
+    OPT_MODE_BALANCED,
+    OPT_MODE_MAX_UTIL,
+    OPT_MODE_MIN_BOXES,
+    OPT_MODE_PRIORITY,
     box_specs_to_rows,
     generate_outputs,
     rows_to_box_specs,
@@ -183,6 +187,21 @@ def main():
             help="与并列同级：在配箱前按尺寸条件将两件货垂直合成一个单元，再分配箱型。"
             "仅封闭箱型（20GP/40GP/40HQ）支持；FR 与定制板不支持堆叠。",
         )
+        OPT_LABELS = {
+            "均衡（推荐：总容积与箱数权衡）": OPT_MODE_BALANCED,
+            "少箱优先（运费场景）": OPT_MODE_MIN_BOXES,
+            "利用率优先": OPT_MODE_MAX_UTIL,
+            "严格按箱型优先级": OPT_MODE_PRIORITY,
+        }
+        opt_label = st.selectbox(
+            "优化目标",
+            list(OPT_LABELS.keys()),
+            index=0,
+            help="均衡：最小化雇佣总容积（少用过大空箱）；"
+            "少箱优先：箱数最少；利用率优先：体积填装率最高；"
+            "严格优先级：按下方顺序强制先装第一种箱型。",
+        )
+        opt_mode = OPT_LABELS[opt_label]
         margin_now = st.number_input(
             "尺寸安全余量 (mm)",
             min_value=0.0,
@@ -210,7 +229,8 @@ def main():
             priority_text = st.text_input(
                 "箱型优先级顺序（逗号分隔）",
                 value=priority_default,
-                help="示例：40HQ,40FR,20FR,20GP。仅保留已勾选箱型，按你填写顺序配箱。",
+                help="仅「严格按箱型优先级」目标时强制按此顺序灌箱；"
+                "其他目标下顺序作为搜索起点之一。示例：20GP,40HQ。",
             )
             typed = [x.strip() for x in priority_text.replace("，", ",").split(",") if x.strip()]
             if typed:
@@ -253,14 +273,16 @@ def main():
                         enable_stack=enable_stack,
                         box_specs=box_specs,
                         size_safety_margin_mm=float(st.session_state.size_safety_margin_mm),
+                        opt_mode=opt_mode,
                     )
                 except Exception as exc:
                     st.error(f"生成失败：{exc}")
                     return
 
             st.success(
-                f"生成完成（安全余量 {st.session_state.size_safety_margin_mm:g} mm，"
-                f"40HQ 有效限高 {2500 - float(st.session_state.size_safety_margin_mm):g} mm）"
+                f"生成完成｜目标：{opt_label}｜"
+                f"余量 {st.session_state.size_safety_margin_mm:g} mm｜"
+                f"40HQ 有效限高 {2500 - float(st.session_state.size_safety_margin_mm):g} mm"
             )
             output_paths = [p for _, p in outputs]
             for name, p in outputs:
