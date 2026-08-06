@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import random
@@ -1985,17 +1985,87 @@ def pack_scenario3(items: List[Item], enable_stack: bool = False) -> Tuple[Dict[
     return optimize_with_optional_boxes(units, rules), stack_merges
 
 
+def _capacity_sorted_codes(codes: List[str], descending: bool = True) -> List[str]:
+    """Sort box codes by approximate internal volume capacity."""
+    return sorted(
+        codes,
+        key=lambda c: box_volume_capacity(c),
+        reverse=descending,
+    )
+
+
+def _priority_preference_score(assignments: Dict[int, str], priority_order: List[str]) -> float:
+    """Lower is better: reward use of earlier (higher-priority) box types.
+
+    Soft preference only — used as a late tie-breaker after box count and utilization.
+    """
+    if not assignments or not priority_order:
+        return 0.0
+    rank = {c: i for i, c in enumerate(priority_order)}
+    unique_boxes = set(str(v) for v in assignments.values())
+    models: Dict[str, int] = {}
+    for b in unique_boxes:
+        model = b.split("-", 1)[0]
+        models[model] = models.get(model, 0) + 1
+    score = 0.0
+    for model, cnt in models.items():
+        score += cnt * float(rank.get(model, len(priority_order) + 1))
+    return score
+
+
 def pack_custom(items: List[Item], box_codes: List[str], enable_stack: bool = False) -> Tuple[Dict[int, str], List[List[int]]]:
+    """Custom mode: only selected box types; primary goal = max utilization (min boxes).
+
+    Priority order from the UI is a soft preference:
+    - We try several packing orders (user priority, reverse, large-first, small-first)
+    - Pick the assignment with best objective (box count → balance → volume util → leftover)
+    - On near-ties, prefer solutions that use higher-priority types more.
+    Boards are NOT auto-appended unless the user selected them.
+    """
     valid = [c for c in box_codes if c in BOX_RULES]
     if not valid:
         raise ValueError("自定义模式下请至少选择一个有效箱型")
-    uniq = list(dict.fromkeys(valid))
-    # Keep user-defined priority order as-is.
-    for b in BOARD_CODES:
-        if b not in uniq:
-            uniq.append(b)
-    units, stack_merges = build_units_with_optional_stack(items, enable_stack=enable_stack, allowed_codes=uniq)
-    return optimize_with_optional_boxes(units, uniq), stack_merges
+    uniq = list(dict.fromkeys(valid))  # preserve user priority order
+    units, stack_merges = build_units_with_optional_stack(
+        items, enable_stack=enable_stack, allowed_codes=uniq
+    )
+
+    # Candidate rule orderings — multi-start search for better utilization.
+    orderings: List[List[str]] = []
+    orderings.append(list(uniq))  # user priority
+    if len(uniq) > 1:
+        orderings.append(list(reversed(uniq)))
+        orderings.append(_capacity_sorted_codes(uniq, descending=True))   # large first
+        orderings.append(_capacity_sorted_codes(uniq, descending=False))  # small first
+
+    # Deduplicate orderings
+    seen = set()
+    unique_orderings: List[List[str]] = []
+    for ord_ in orderings:
+        key = tuple(ord_)
+        if key not in seen:
+            seen.add(key)
+            unique_orderings.append(ord_)
+
+    best: Dict[int, str] | None = None
+    best_obj: Tuple[int, float, float, float] | None = None
+    best_pref = float("inf")
+
+    for ord_ in unique_orderings:
+        cand = optimize_with_optional_boxes(units, ord_)
+        obj = assignment_objective(cand, units)
+        pref = _priority_preference_score(cand, uniq)
+        if best is None or best_obj is None:
+            best, best_obj, best_pref = cand, obj, pref
+            continue
+        if obj < best_obj:
+            best, best_obj, best_pref = cand, obj, pref
+        elif obj == best_obj and pref < best_pref:
+            # Same utilization metrics → prefer higher-priority box mix
+            best, best_obj, best_pref = cand, obj, pref
+
+    assert best is not None
+    return best, stack_merges
 
 
 def pack_auto(items: List[Item], use_hq: bool = False, enable_stack: bool = False) -> Tuple[Dict[int, str], List[List[int]]]:
@@ -2294,6 +2364,34 @@ def normalize_serial_value(v):
     return v
 
 
+def coerce_numeric_cell(v):
+    """Convert numeric-looking strings to float so Excel SUMIF/MAXIFS work.
+
+    Source cells often store L/W/H/weight/volume as text ('1100');
+    Excel then returns 0 from SUMIF on those columns.
+    """
+    if v is None or v == "":
+        return v
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        if isinstance(v, float) and v.is_integer():
+            return int(v)
+        return v
+    if isinstance(v, str):
+        s = v.strip().replace(",", "")
+        if not s:
+            return v
+        try:
+            f = float(s)
+            if f.is_integer():
+                return int(f)
+            return f
+        except ValueError:
+            return v
+    return v
+
+
 def apply_center_alignment(ws, start_row: int, end_row: int, start_col: int = 1, end_col: int = 24):
     for r in range(start_row, end_row + 1):
         for c in range(start_col, end_col + 1):
@@ -2369,6 +2467,9 @@ def apply_assignments(
         for c, v in enumerate(values[old], start=1):
             if c == 1:
                 v = normalize_serial_value(v)
+            elif c in (4, 5, 6, 7, 8, 9):
+                # qty / L / W / H / weight / volume — must be numeric for SUMIF
+                v = coerce_numeric_cell(v)
             st = copy(style_map[old][c - 1]) if old in style_map else None
             safe_set_cell(ws, nr, c, v, set_style=st)
         if old in style_map:
