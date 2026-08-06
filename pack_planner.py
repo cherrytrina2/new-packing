@@ -162,10 +162,6 @@ def apply_box_config(
     parallel: Dict[str, Tuple[float, float]] = {}
     fr_remark: Dict[str, float] = {}
     for code, s in BOX_SPECS.items():
-        # Safety margin is deducted uniformly from L / W / H hard limits.
-        # Door-height reserve (e.g. 20GP) is applied later in unit_fits_rule.
-        # Note: margin=75 blocks 1250+1250 stacks in 40HQ (2500-75=2425);
-        # set margin=0 when such 2-high stacks must be allowed.
         rules[code] = BoxRule(
             code=code,
             length_cap=_safe_cap(s.length_mm, margin) or 0.0,
@@ -1124,100 +1120,34 @@ def max_stack_height_limit(allowed_codes: List[str] | None = None) -> float:
     return max(limits) if limits else 0.0
 
 
-def max_parallel_limits(allowed_codes: List[str] | None = None) -> Tuple[float, float]:
-    """Most permissive parallel (W, H) among allowed closed/FR codes that define them."""
-    codes = allowed_codes or list(PARALLEL_MODEL_LIMITS.keys())
-    best_w, best_h = 0.0, 0.0
-    for c in codes:
-        lim = PARALLEL_MODEL_LIMITS.get(c)
-        if lim is None:
-            continue
-        best_w = max(best_w, lim[0])
-        best_h = max(best_h, lim[1])
-    return best_w, best_h
-
-
-def orient_item_for_parallel(item: Item, width_limit: float) -> Item:
-    """
-    Choose L/W orientation that maximizes side-by-side pairing chance.
-    Prefer putting the *smaller* horizontal dim as width when both orientations
-    fit the width limit (so two copies are more likely to sum under the limit).
-    Does not mutate height or weight.
-    """
-    l, w = item.length, item.width
-    # Both orientations as (length_along_box, width_across_box)
-    candidates = [(l, w), (w, l)]
-    viable = [(a, b) for a, b in candidates if b <= width_limit]
-    if not viable:
-        # Keep original if neither fits (oversized width will be rejected later).
-        return item
-    # Prefer smaller width (better parallel chance), then shorter length.
-    a, b = sorted(viable, key=lambda t: (t[1], t[0]))[0]
-    if a == item.length and b == item.width:
-        return item
-    return Item(
-        row=item.row,
-        length=a,
-        width=b,
-        height=item.height,
-        weight=item.weight,
-        bound_rows=list(item.bound_rows) if item.bound_rows else [item.row],
-    )
-
-
-def orient_items_for_closed_packing(items: List[Item], width_limit: float) -> List[Item]:
-    return [orient_item_for_parallel(it, width_limit) for it in items]
-
-
 def build_units_with_optional_stack(
     items: List[Item],
     enable_stack: bool = False,
     allowed_codes: List[str] | None = None,
 ) -> Tuple[List[Unit], List[List[int]]]:
     """
-    Form packing units from items with the same priority as parallel grouping:
+    Form packing units from items. When enable_stack is True, vertically pair
+    size-compatible singles *before* box assignment — same priority as parallel
+    grouping, not a post-hoc fix inside already-opened boxes.
 
-    1) Orient L/W to favour side-by-side pairing under closed-box width limits.
-    2) Build parallel (并列) pairs.
-    3) When enable_stack, vertically stack compatible units (including parallel
-       super-units) so 2×2 dense blocks are formed before box assignment.
-
-    FR / boards never receive stacked units (filtered later in pack_by_rule).
-
-    Returns (units, stack_merge_row_groups). Parallel merges are derived later
-    from multi-item non-stack units / assignment inference.
+    Returns (units, stack_merge_row_groups).
     """
-    width_limit, height_limit_par = max_parallel_limits(allowed_codes)
-    if width_limit <= 0:
-        width_limit = 2300.0
-    if height_limit_par <= 0:
-        height_limit_par = 2500.0
-
-    # Orientation + parallel first (always valuable for closed-box density).
-    oriented = orient_items_for_closed_packing(items, width_limit)
-    parallel_units, leftovers = build_parallel_groups(
-        oriented, width_limit=width_limit, height_limit=height_limit_par
-    )
-    units: List[Unit] = parallel_units + [Unit.from_item(i) for i in leftovers]
-
-    stack_merge_rows: List[List[int]] = []
+    units: List[Unit] = [Unit.from_item(i) for i in items]
     if not enable_stack:
-        return units, stack_merge_rows
-
+        return units, []
     height_limit = max_stack_height_limit(allowed_codes)
     if height_limit <= 0:
-        return units, stack_merge_rows
-
+        return units, []
     pairs = build_stack_pairs(units, height_limit)
     if not pairs:
-        return units, stack_merge_rows
-
+        return units, []
+    merge_rows: List[List[int]] = []
     for a, b in pairs:
         rows = sorted(set(a.rows() + b.rows()))
         if len(rows) > 1:
-            stack_merge_rows.append(rows)
+            merge_rows.append(rows)
     stacked = combine_stacked_units(units, pairs)
-    return stacked, stack_merge_rows
+    return stacked, merge_rows
 
 
 def fr_volume_utilization(unit: Unit, code: str) -> float:
@@ -1631,50 +1561,42 @@ def repack_prioritize_merging_underfilled(
     return out
 
 
-def optimize_with_optional_boxes(
-    units: List[Unit],
-    rules: List[str],
-    *,
-    respect_priority: bool = False,
-    opt_mode: str | None = None,
-) -> Dict[int, str]:
-    """Pack with optional post-optimizations.
-
-    respect_priority=True:
-      - Strictly follow ``rules`` order: fill type[0] first, leftovers to type[1], ...
-      - Do NOT drop listed types just because another mix has fewer boxes.
-    opt_mode: min_boxes | max_util | balanced | priority — drives comparison.
-    """
-    om = opt_mode or _CURRENT_OPT_MODE
+def optimize_with_optional_boxes(units: List[Unit], rules: List[str]) -> Dict[int, str]:
     base = pack_by_rule_priority_mode(units, rules)
-    best = global_backoff_optimize(units, rules, base, om)
-    best_obj = assignment_objective(best, units, om)
+    best = global_backoff_optimize(units, rules, base)
+    best_obj = assignment_objective(best, units)
 
-    if not respect_priority:
-        if "20FR" in rules and "40FR" in rules and assignment_uses_model(best, "20FR"):
-            rules_no_20fr = [r for r in rules if r != "20FR"]
-            base_no = pack_by_rule_priority_mode(units, rules_no_20fr)
-            cand_no = global_backoff_optimize(units, rules_no_20fr, base_no, om)
-            obj_no = assignment_objective(cand_no, units, om)
-            if should_replace_assignment(best, best_obj, cand_no, obj_no, units, om):
-                best, best_obj = cand_no, obj_no
+    # 20FR retention rule:
+    # 1) Compare box count first.
+    # 2) When box count ties, compare volume utilization.
+    # Keep 20FR when it has higher utilization under equal box count.
+    if "20FR" in rules and "40FR" in rules and assignment_uses_model(best, "20FR"):
+        rules_no_20fr = [r for r in rules if r != "20FR"]
+        base_no = pack_by_rule_priority_mode(units, rules_no_20fr)
+        cand_no = global_backoff_optimize(units, rules_no_20fr, base_no)
+        obj_no = assignment_objective(cand_no, units)
+        if should_replace_assignment(best, best_obj, cand_no, obj_no, units):
+            best, best_obj = cand_no, obj_no
 
-        if "20GP" in rules and assignment_uses_model(best, "20GP"):
-            rules_no_20gp = [r for r in rules if r != "20GP"]
-            base_no = pack_by_rule_priority_mode(units, rules_no_20gp)
-            cand_no = global_backoff_optimize(units, rules_no_20gp, base_no, om)
-            obj_no = assignment_objective(cand_no, units, om)
-            if should_replace_assignment(best, best_obj, cand_no, obj_no, units, om):
-                best, best_obj = cand_no, obj_no
+    # 20GP is only kept when it reduces total box count vs path without 20GP.
+    if "20GP" in rules and assignment_uses_model(best, "20GP"):
+        rules_no_20gp = [r for r in rules if r != "20GP"]
+        base_no = pack_by_rule_priority_mode(units, rules_no_20gp)
+        cand_no = global_backoff_optimize(units, rules_no_20gp, base_no)
+        obj_no = assignment_objective(cand_no, units)
+        if should_replace_assignment(best, best_obj, cand_no, obj_no, units):
+            best, best_obj = cand_no, obj_no
 
+    # Re-pack iteratively when boxes are underfilled by length.
+    # In these rounds we bias strongly toward width-similar merging.
     for _ in range(UNDERFILLED_REPACK_MAX_ROUNDS):
         if not has_underfilled_boxes(best, units):
             break
         cand_merge = repack_prioritize_merging_underfilled(units, rules, best)
         cand_merge = consolidate_tiny_underfilled_boxes(cand_merge, units)
-        cand_merge = global_backoff_optimize(units, rules, cand_merge, om)
-        obj_merge = assignment_objective(cand_merge, units, om)
-        if should_replace_assignment(best, best_obj, cand_merge, obj_merge, units, om):
+        cand_merge = global_backoff_optimize(units, rules, cand_merge)
+        obj_merge = assignment_objective(cand_merge, units)
+        if should_replace_assignment(best, best_obj, cand_merge, obj_merge, units):
             best, best_obj = cand_merge, obj_merge
         else:
             break
@@ -1696,100 +1618,37 @@ def box_volume_capacity(model: str) -> float:
     return max(0.0, rule.length_cap) * max(0.0, eff_width) * max(0.0, max_h)
 
 
-# Optimization modes for packing (especially custom multi-type).
-OPT_MODE_MIN_BOXES = "min_boxes"      # fewest containers first (freight $)
-OPT_MODE_MAX_UTIL = "max_util"        # highest volume fill rate first
-OPT_MODE_BALANCED = "balanced"        # minimize total hired capacity (box count × size trade-off)
-OPT_MODE_PRIORITY = "priority"        # hard user priority order
-
-# Thread-local-ish default used by helpers when not passed explicitly.
-_CURRENT_OPT_MODE: str = OPT_MODE_BALANCED
-
-
-def assignment_metrics(assignments: Dict[int, str], units: List[Unit]) -> Dict[str, float]:
-    """Compute packing quality metrics used by all objective modes."""
-    empty = {
-        "box_count": 10**9,
-        "balance_excess": 10**9,
-        "util_penalty": 10**9,
-        "leftover": 10**9,
-        "capacity_volume": 10**9,
-        "cargo_volume": 0.0,
-        "mean_length_util": 0.0,
-    }
+def assignment_objective(assignments: Dict[int, str], units: List[Unit]) -> Tuple[int, float, float, float]:
     if not assignments:
-        return empty
+        return (10**9, 10**9, 10**9, 10**9)
     box_units = box_units_from_assignments(assignments, units)
-    if not box_units:
-        return empty
+    if not box_units or len(box_units) == 0:
+        return (10**9, 10**9, 10**9, 10**9)
     assigned_unit_count = sum(len(us) for us in box_units.values())
     if assigned_unit_count < len(units):
-        return empty
+        return (10**9, 10**9, 10**9, 10**9)
 
     total_leftover = 0.0
     total_balance_excess = 0.0
     total_cargo_volume = 0.0
     total_box_capacity_volume = 0.0
-    length_util_sum = 0.0
     for b, us in box_units.items():
         model = b.split("-", 1)[0]
         rule = BOX_RULES.get(model)
         if rule is None:
             continue
-        used_len = used_length_of_units(us)
-        total_leftover += max(0.0, rule.length_cap - used_len)
-        if rule.length_cap > 0:
-            length_util_sum += min(1.0, used_len / rule.length_cap)
-        total_cargo_volume += sum(
-            max(0.0, u.length) * max(0.0, u.width) * max(0.0, u.height) for u in us
-        )
+        total_leftover += max(0.0, rule.length_cap - used_length_of_units(us))
+        total_cargo_volume += sum(max(0.0, u.length) * max(0.0, u.width) * max(0.0, u.height) for u in us)
         total_box_capacity_volume += box_volume_capacity(model)
         if any(u.weight >= BIG_PIECE_WEIGHT for u in us):
             total_balance_excess += max(0.0, estimate_side_diff(us) - SIDE_WEIGHT_DIFF_LIMIT)
-    n_boxes = len(box_units)
-    util_penalty = (
-        (total_box_capacity_volume / total_cargo_volume) if total_cargo_volume > 0 else 10**9
-    )
-    mean_length_util = length_util_sum / n_boxes if n_boxes else 0.0
-    return {
-        "box_count": float(n_boxes),
-        "balance_excess": total_balance_excess,
-        "util_penalty": util_penalty,
-        "leftover": total_leftover,
-        "capacity_volume": total_box_capacity_volume,
-        "cargo_volume": total_cargo_volume,
-        "mean_length_util": mean_length_util,
-    }
-
-
-def assignment_objective(
-    assignments: Dict[int, str],
-    units: List[Unit],
-    opt_mode: str | None = None,
-) -> Tuple:
-    """Lexicographic objective; lower tuple is better.
-
-    Modes (industry-aligned):
-      min_boxes  – box count → balance → util → leftover
-      max_util   – util → box count → balance → leftover
-      balanced   – total hired capacity → box count → util → leftover
-                   (trades a few more small boxes vs oversized empty large boxes)
-      priority   – same as min_boxes (order enforced elsewhere)
-    """
-    mode = opt_mode or _CURRENT_OPT_MODE
-    m = assignment_metrics(assignments, units)
-    bc = m["box_count"]
-    bal = m["balance_excess"]
-    util = m["util_penalty"]
-    left = m["leftover"]
-    cap = m["capacity_volume"]
-
-    if mode == OPT_MODE_MAX_UTIL:
-        return (util, bc, bal, left)
-    if mode == OPT_MODE_BALANCED:
-        return (cap, bc, util, bal, left)
-    # min_boxes / priority / default
-    return (bc, bal, util, left)
+    utilization_penalty = (total_box_capacity_volume / total_cargo_volume) if total_cargo_volume > 0 else 10**9
+    # Objective order:
+    # 1) minimize box count
+    # 2) minimize side-balance excess
+    # 3) maximize volume utilization (implemented as minimizing capacity/cargo ratio)
+    # 4) minimize leftover length
+    return (len(box_units), total_balance_excess, utilization_penalty, total_leftover)
 
 
 def assignment_box_volume(assignments: Dict[int, str], units: List[Unit]) -> float:
@@ -1805,45 +1664,39 @@ def assignment_box_volume(assignments: Dict[int, str], units: List[Unit]) -> flo
 
 def should_replace_assignment(
     current: Dict[int, str],
-    current_obj: Tuple,
+    current_obj: Tuple[int, float, float, float],
     candidate: Dict[int, str],
-    candidate_obj: Tuple,
+    candidate_obj: Tuple[int, float, float, float],
     units: List[Unit],
-    opt_mode: str | None = None,
 ) -> bool:
-    """Accept candidate when its objective tuple is strictly better."""
-    mode = opt_mode or _CURRENT_OPT_MODE
-    if candidate_obj < current_obj:
+    # Unified rule across scenarios:
+    # 1) Fewer boxes wins.
+    # 2) If box count ties, choose the one with higher packing box-volume.
+    # 3) If still tied, fall back to original objective tuple.
+    if candidate_obj[0] < current_obj[0]:
         return True
-    if candidate_obj > current_obj:
+    if candidate_obj[0] > current_obj[0]:
         return False
-    # Tie on primary objective: prefer higher mean length utilization
-    cm = assignment_metrics(candidate, units)
-    cur = assignment_metrics(current, units)
-    if cm["mean_length_util"] > cur["mean_length_util"] + 1e-6:
+
+    cand_vol = assignment_box_volume(candidate, units)
+    cur_vol = assignment_box_volume(current, units)
+    if cand_vol > cur_vol + 1e-6:
         return True
-    if mode == OPT_MODE_MIN_BOXES:
-        # Prefer smaller total capacity when counts equal (tighter fit)
-        if cm["capacity_volume"] < cur["capacity_volume"] - 1e-6:
-            return True
-    return False
+    if cand_vol < cur_vol - 1e-6:
+        return False
+
+    return candidate_obj < current_obj
 
 
-def global_backoff_optimize(
-    units: List[Unit],
-    rule_codes: List[str],
-    base: Dict[int, str],
-    opt_mode: str | None = None,
-) -> Dict[int, str]:
-    om = opt_mode or _CURRENT_OPT_MODE
+def global_backoff_optimize(units: List[Unit], rule_codes: List[str], base: Dict[int, str]) -> Dict[int, str]:
     best = base.copy()
-    best_obj = assignment_objective(best, units, om)
+    best_obj = assignment_objective(best, units)
     strategies: List[Tuple[str, int]] = [("length", 0), ("weight", 0), ("hybrid", 0), ("width", 0)]
     strategies.extend([("random", i) for i in range(1, 9)])
     for mode, seed in strategies:
         cand = pack_by_rule_priority_mode(units, rule_codes, order_mode=mode, random_seed=seed)
-        obj = assignment_objective(cand, units, om)
-        if should_replace_assignment(best, best_obj, cand, obj, units, om):
+        obj = assignment_objective(cand, units)
+        if should_replace_assignment(best, best_obj, cand, obj, units):
             best = cand
             best_obj = obj
     return best
@@ -2062,101 +1915,17 @@ def pack_scenario3(items: List[Item], enable_stack: bool = False) -> Tuple[Dict[
     return optimize_with_optional_boxes(units, rules), stack_merges
 
 
-def _capacity_sorted_codes(codes: List[str], descending: bool = True) -> List[str]:
-    """Sort box codes by approximate internal volume capacity."""
-    return sorted(
-        codes,
-        key=lambda c: box_volume_capacity(c),
-        reverse=descending,
-    )
-
-
-def _priority_preference_score(assignments: Dict[int, str], priority_order: List[str]) -> float:
-    """Lower is better: reward use of earlier (higher-priority) box types.
-
-    Soft preference only — used as a late tie-breaker after box count and utilization.
-    """
-    if not assignments or not priority_order:
-        return 0.0
-    rank = {c: i for i, c in enumerate(priority_order)}
-    unique_boxes = set(str(v) for v in assignments.values())
-    models: Dict[str, int] = {}
-    for b in unique_boxes:
-        model = b.split("-", 1)[0]
-        models[model] = models.get(model, 0) + 1
-    score = 0.0
-    for model, cnt in models.items():
-        score += cnt * float(rank.get(model, len(priority_order) + 1))
-    return score
-
-
-def pack_custom(
-    items: List[Item],
-    box_codes: List[str],
-    enable_stack: bool = False,
-    opt_mode: str = OPT_MODE_BALANCED,
-) -> Tuple[Dict[int, str], List[List[int]]]:
-    """Custom mode: only selected box types.
-
-    opt_mode:
-      priority  – hard order: fill type[0] first, then type[1], ...
-      min_boxes – multi-start search; fewest containers wins
-      max_util  – multi-start; highest volume fill rate wins
-      balanced  – multi-start; minimize total hired capacity (count × size trade-off)
-
-    Boards are NOT auto-appended unless the user selected them.
-    """
-    global _CURRENT_OPT_MODE
+def pack_custom(items: List[Item], box_codes: List[str], enable_stack: bool = False) -> Tuple[Dict[int, str], List[List[int]]]:
     valid = [c for c in box_codes if c in BOX_RULES]
     if not valid:
         raise ValueError("自定义模式下请至少选择一个有效箱型")
     uniq = list(dict.fromkeys(valid))
-    units, stack_merges = build_units_with_optional_stack(
-        items, enable_stack=enable_stack, allowed_codes=uniq
-    )
-
-    mode = opt_mode if opt_mode in (
-        OPT_MODE_MIN_BOXES, OPT_MODE_MAX_UTIL, OPT_MODE_BALANCED, OPT_MODE_PRIORITY
-    ) else OPT_MODE_BALANCED
-    _CURRENT_OPT_MODE = mode
-
-    if mode == OPT_MODE_PRIORITY:
-        assignments = optimize_with_optional_boxes(
-            units, uniq, respect_priority=True, opt_mode=mode
-        )
-        return assignments, stack_merges
-
-    # Multi-start: user order, reverse, large-first, small-first
-    orderings: List[List[str]] = [list(uniq)]
-    if len(uniq) > 1:
-        orderings.append(list(reversed(uniq)))
-        orderings.append(_capacity_sorted_codes(uniq, descending=True))
-        orderings.append(_capacity_sorted_codes(uniq, descending=False))
-    seen = set()
-    unique_orderings: List[List[str]] = []
-    for ord_ in orderings:
-        key = tuple(ord_)
-        if key not in seen:
-            seen.add(key)
-            unique_orderings.append(ord_)
-
-    best: Dict[int, str] | None = None
-    best_obj: Tuple | None = None
-    # Allow dropping a type only for min_boxes (freight-driven)
-    respect = mode != OPT_MODE_MIN_BOXES
-
-    for ord_ in unique_orderings:
-        cand = optimize_with_optional_boxes(
-            units, ord_, respect_priority=respect, opt_mode=mode
-        )
-        obj = assignment_objective(cand, units, mode)
-        if best is None or best_obj is None or should_replace_assignment(
-            best, best_obj, cand, obj, units, mode
-        ):
-            best, best_obj = cand, obj
-
-    assert best is not None
-    return best, stack_merges
+    # Keep user-defined priority order as-is.
+    for b in BOARD_CODES:
+        if b not in uniq:
+            uniq.append(b)
+    units, stack_merges = build_units_with_optional_stack(items, enable_stack=enable_stack, allowed_codes=uniq)
+    return optimize_with_optional_boxes(units, uniq), stack_merges
 
 
 def pack_auto(items: List[Item], use_hq: bool = False, enable_stack: bool = False) -> Tuple[Dict[int, str], List[List[int]]]:
@@ -2169,63 +1938,10 @@ def pack_auto(items: List[Item], use_hq: bool = False, enable_stack: bool = Fals
 
 
 def clear_merges(ws):
-    """Remove every merge that touches the data/output region (rows >= DATA_START_ROW, cols 1-24).
-
-    Also removes merges that start above the data area but extend into it.
-    Multiple passes handle overlapping merges left by prior outputs/templates.
-    """
-    for _ in range(8):
-        ranges = [
-            r
-            for r in list(ws.merged_cells.ranges)
-            if r.max_row >= DATA_START_ROW and r.min_col <= 24 and r.max_col >= 1
-        ]
-        if not ranges:
-            break
-        for r in ranges:
-            try:
-                ws.unmerge_cells(str(r))
-            except Exception:
-                pass
-
-
-def _unmerge_cell(ws, row: int, col: int):
-    """Unmerge every range that covers (row, col). Repeat until none remain."""
-    for _ in range(8):
-        hit = False
-        for mr in list(ws.merged_cells.ranges):
-            if mr.min_row <= row <= mr.max_row and mr.min_col <= col <= mr.max_col:
-                try:
-                    ws.unmerge_cells(str(mr))
-                except Exception:
-                    pass
-                hit = True
-        if not hit:
-            break
-
-
-def safe_set_cell(ws, row: int, col: int, value=None, set_style=None):
-    """Write to a cell even if it currently belongs to a merged range.
-
-    MergedCell.value is read-only. Unmerge any covering range first, then write.
-    """
-    cell = ws.cell(row=row, column=col)
-    if isinstance(cell, MergedCell):
-        _unmerge_cell(ws, row, col)
-        cell = ws.cell(row=row, column=col)
-    if isinstance(cell, MergedCell):
-        # Stale MergedCell after overlapping unmerges: drop internal entry and recreate.
-        _unmerge_cell(ws, row, col)
-        if hasattr(ws, "_cells") and (row, col) in ws._cells:
-            del ws._cells[(row, col)]
-        cell = ws.cell(row=row, column=col)
-    if isinstance(cell, MergedCell):
-        raise AttributeError(
-            f"Cannot write to merged cell at row={row} col={col} after unmerge attempts"
-        )
-    cell.value = value
-    if set_style is not None:
-        cell._style = set_style
+    # Clear output-area merges including formula block (M~X), to avoid stale merge conflicts.
+    ranges = [r for r in ws.merged_cells.ranges if r.min_row >= DATA_START_ROW and r.min_col <= 24]
+    for r in ranges:
+        ws.unmerge_cells(str(r))
 
 
 def apply_output_style(ws, start_row: int, end_row: int, end_col: int = REMARK_COL):
@@ -2298,21 +2014,12 @@ def merge_box_formula_runs(ws, start_row: int, end_row: int, start_col: int = 13
 
 
 def append_row_remark(ws, row: int, text: str):
-    cell = ws.cell(row=row, column=REMARK_COL)
-    # Read via master if this is a merged remark cell.
-    cur = None
-    if isinstance(cell, MergedCell):
-        for mr in ws.merged_cells.ranges:
-            if mr.min_row <= row <= mr.max_row and mr.min_col <= REMARK_COL <= mr.max_col:
-                cur = ws.cell(row=mr.min_row, column=mr.min_col).value
-                break
-    else:
-        cur = cell.value
+    cur = ws.cell(row=row, column=REMARK_COL).value
     cur_s = str(cur).strip() if cur is not None else ""
     parts = [p for p in cur_s.replace("；", ";").split(";") if p]
     if text not in parts:
         parts.append(text)
-    safe_set_cell(ws, row, REMARK_COL, "；".join(parts))
+    ws.cell(row=row, column=REMARK_COL, value="；".join(parts))
 
 
 def build_over_limit_remark(model: str, width: float | None, height: float | None) -> str | None:
@@ -2335,35 +2042,15 @@ def fill_box_formula_cells(
     box_seq_by_row: Dict[int, int],
     summary_styles: Dict[int, object] | None = None,
     formula_styles: Dict[int, object] | None = None,
-    data_end_row: int | None = None,
 ):
-    """Write per-box calculation formulas (M~W) and summary formulas (I3/K3/M3).
-
-    data_end_row: last data row included in SUMIF/MAXIFS ranges. Must cover all
-    cargo rows; previously hard-coded to ~1000 which silently dropped rows
-    beyond that on large lists.
-    """
-    if data_end_row is None:
-        data_end_row = max(cargo_rows) if cargo_rows else DATA_END_ROW
-    # Keep a small buffer past the last cargo row for safety.
-    end = max(int(data_end_row), DATA_START_ROW) + 5
-    end = max(end, 100)
-
-    # Top summary formulas — range must cover full cargo block.
-    ws.cell(row=3, column=9, value=f"=SUM(V{DATA_START_ROW}:V{end})")   # I3 船司结算方量
-    ws.cell(row=3, column=11, value="=G3-I3")                           # K3 结算差额
-    ws.cell(row=3, column=13, value=f"=SUM(U{DATA_START_ROW}:U{end})")  # M3 底面积总和
+    # Top summary formulas.
+    ws.cell(row=3, column=9, value="=SUM(V6:V505)")   # I3
+    ws.cell(row=3, column=11, value="=G3-I3")         # K3
+    ws.cell(row=3, column=13, value="=SUM(U6:U1005)") # M3
     for c in (9, 11, 13):
         cell = ws.cell(row=3, column=c)
         if summary_styles and c in summary_styles and summary_styles[c] is not None:
             cell._style = copy(summary_styles[c])
-
-    x_range = f"$X${DATA_START_ROW}:$X${end}"
-    e_range = f"$E${DATA_START_ROW}:$E${end}"
-    f_range = f"$F${DATA_START_ROW}:$F${end}"
-    g_range = f"$G${DATA_START_ROW}:$G${end}"
-    h_range = f"$H${DATA_START_ROW}:$H${end}"
-    i_range = f"$I${DATA_START_ROW}:$I${end}"
 
     for r in cargo_rows:
         seq_no = box_seq_by_row.get(r)
@@ -2372,12 +2059,12 @@ def fill_box_formula_cells(
         # X: formula sequence id; same box -> same id.
         ws.cell(row=r, column=24, value=seq_no)
 
-        # M~W formula block (match template logic; ranges cover full data).
-        ws.cell(row=r, column=13, value=f"=SUMIF({x_range},X{r},{e_range})")  # M
-        ws.cell(row=r, column=14, value=f"=MAXIFS({f_range},{x_range},X{r})")  # N
-        ws.cell(row=r, column=15, value=f"=MAXIFS({g_range},{x_range},X{r})")  # O
-        ws.cell(row=r, column=16, value=f"=SUMIF({x_range},X{r},{i_range})")  # P
-        ws.cell(row=r, column=17, value=f"=SUMIF({x_range},X{r},{h_range})")  # Q
+        # M~W formula block (match template logic).
+        ws.cell(row=r, column=13, value=f"=SUMIF($X$6:$X$1000,X{r},$E$6:$E$1000)")  # M
+        ws.cell(row=r, column=14, value=f"=MAXIFS($F$6:$F$1000,$X$6:$X$1000,X{r})") # N
+        ws.cell(row=r, column=15, value=f"=MAXIFS($G$6:$G$1000,$X$6:$X$1000,X{r})") # O
+        ws.cell(row=r, column=16, value=f"=SUMIF($X$6:$X$1000,X{r},$I$6:$I$1000)")   # P
+        ws.cell(row=r, column=17, value=f"=SUMIF($X$6:$X$1000,X{r},$H$6:$H$1000)")   # Q
         ws.cell(
             row=r,
             column=18,
@@ -2397,43 +2084,42 @@ def fill_box_formula_cells(
                 f'=IF(J{r}="40GP",2438,'
                 f'IF(J{r}="40HQ",2438,'
                 f'IF(OR(J{r}="40FR",J{r}="20FR"),'
-                f'MAX(2374,MAXIFS({f_range},{x_range},X{r})),'
+                f'MAX(2374,MAXIFS($F$6:$F$1000,$X$6:$X$1000,X{r})),'
                 f'IF(OR(J{r}="710板",J{r}="710定制板",J{r}="880板",J{r}="880定制板"),'
-                f'MAX(5800,MAXIFS({f_range},{x_range},X{r})),'
-                f'MAXIFS({f_range},{x_range},X{r})))))'
+                f'MAX(5800,MAXIFS($F$6:$F$1000,$X$6:$X$1000,X{r})),'
+                f'MAXIFS($F$6:$F$1000,$X$6:$X$1000,X{r})))))'
             ),
         )  # S
         ws.cell(
             row=r,
             column=20,
             value=(
-                f'=IF(J{r}="40FR",MAX(MAXIFS({g_range},{x_range},X{r})+648,1900),'
-                f'IF(J{r}="20FR",MAX(MAXIFS({g_range},{x_range},X{r})+350,1900),'
-                f'IF(OR(J{r}="710板",J{r}="710定制板"),MAX(MAXIFS({g_range},{x_range},X{r})+400,1900),'
-                f'IF(OR(J{r}="880板",J{r}="880定制板"),MAX(MAXIFS({g_range},{x_range},X{r})+400,1900),'
+                f'=IF(J{r}="40FR",MAX(MAXIFS($G$6:$G$1000,$X$6:$X$1000,X{r})+648,1900),'
+                f'IF(J{r}="20FR",MAX(MAXIFS($G$6:$G$1000,$X$6:$X$1000,X{r})+350,1900),'
+                f'IF(OR(J{r}="710板",J{r}="710定制板"),MAX(MAXIFS($G$6:$G$1000,$X$6:$X$1000,X{r})+400,1900),'
+                f'IF(OR(J{r}="880板",J{r}="880定制板"),MAX(MAXIFS($G$6:$G$1000,$X$6:$X$1000,X{r})+400,1900),'
                 f'IF(J{r}="40GP",2896,IF(J{r}="40HQ",2896,0))))))'
             ),
         )  # T
-        ws.cell(row=r, column=21, value=f"=R{r}*S{r}/1000000")           # U
-        ws.cell(row=r, column=22, value=f"=R{r}*S{r}*T{r}/1000000000")   # V
+        ws.cell(row=r, column=21, value=f"=R{r}*S{r}/1000000")      # U
+        ws.cell(row=r, column=22, value=f"=R{r}*S{r}*T{r}/1000000000")  # V
         ws.cell(
             row=r,
             column=23,
             value=(
-                f'=IF(J{r}="40FR",SUMIF({x_range},X{r},{h_range})+5100,'
-                f'IF(J{r}="20FR",SUMIF({x_range},X{r},{h_range})+2800,'
-                f'IF(J{r}="40GP",SUMIF({x_range},X{r},{h_range})+4000,'
-                f'IF(J{r}="40HQ",SUMIF({x_range},X{r},{h_range})+3700,'
-                f'IF(OR(J{r}="710板",J{r}="710定制板"),SUMIF({x_range},X{r},{h_range})+0,'
-                f'IF(OR(J{r}="880板",J{r}="880定制板"),SUMIF({x_range},X{r},{h_range})+0,0))))))'
+                f'=IF(J{r}="40FR",SUMIF($X$6:$X$1005,X{r},$H$6:$H$1005)+5100,'
+                f'IF(J{r}="20FR",SUMIF($X$6:$X$1005,X{r},$H$6:$H$1005)+2800,'
+                f'IF(J{r}="40GP",SUMIF($X$6:$X$1005,X{r},$H$6:$H$1005)+4000,'
+                f'IF(J{r}="40HQ",SUMIF($X$6:$X$1005,X{r},$H$6:$H$1005)+3700,'
+                f'IF(OR(J{r}="710板",J{r}="710定制板"),SUMIF($X$6:$X$1005,X{r},$H$6:$H$1005)+0,'
+                f'IF(OR(J{r}="880板",J{r}="880定制板"),SUMIF($X$6:$X$1005,X{r},$H$6:$H$1005)+0,0))))))'
             ),
         )  # W
 
         for c in range(13, 25):
             cell = ws.cell(row=r, column=c)
             if formula_styles and c in formula_styles and formula_styles[c] is not None:
-                if not isinstance(cell, MergedCell):
-                    cell._style = copy(formula_styles[c])
+                cell._style = copy(formula_styles[c])
 
 
 def apply_uniform_generated_styles(ws, rows: List[int], style_map: Dict[int, object]):
@@ -2452,34 +2138,6 @@ def apply_uniform_generated_styles(ws, rows: List[int], style_map: Dict[int, obj
 def normalize_serial_value(v):
     if isinstance(v, float) and v.is_integer():
         return int(v)
-    return v
-
-
-def coerce_numeric_cell(v):
-    """Convert numeric-looking strings to float so Excel SUMIF/MAXIFS work.
-
-    Source cells often store L/W/H/weight/volume as text ('1100');
-    Excel then returns 0 from SUMIF on those columns.
-    """
-    if v is None or v == "":
-        return v
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        if isinstance(v, float) and v.is_integer():
-            return int(v)
-        return v
-    if isinstance(v, str):
-        s = v.strip().replace(",", "")
-        if not s:
-            return v
-        try:
-            f = float(s)
-            if f.is_integer():
-                return int(f)
-            return f
-        except ValueError:
-            return v
     return v
 
 
@@ -2546,10 +2204,9 @@ def apply_assignments(
     non_cargo_rows = [r for r in source_active_rows if r not in set(ordered_rows)]
     final_rows = ordered_rows + non_cargo_rows
 
-    # clear_merges already ran; still guard against residual MergedCell writes.
     for row in range(DATA_START_ROW, max(ws.max_row, DATA_END_ROW) + 1):
         for c in range(1, REMARK_COL + 1):
-            safe_set_cell(ws, row, c, None)
+            ws.cell(row=row, column=c).value = None
 
     old_to_new: Dict[int, int] = {}
     for idx, old in enumerate(final_rows):
@@ -2558,17 +2215,10 @@ def apply_assignments(
         for c, v in enumerate(values[old], start=1):
             if c == 1:
                 v = normalize_serial_value(v)
-            elif c in (4, 5, 6, 7, 8, 9):
-                # qty / L / W / H / weight / volume — must be numeric for SUMIF
-                v = coerce_numeric_cell(v)
-            st = copy(style_map[old][c - 1]) if old in style_map else None
-            safe_set_cell(ws, nr, c, v, set_style=st)
+            ws.cell(row=nr, column=c, value=v)
         if old in style_map:
-            for c in range(len(values[old]) + 1, REMARK_COL + 1):
-                st = copy(style_map[old][c - 1])
-                cell = ws.cell(row=nr, column=c)
-                if not isinstance(cell, MergedCell):
-                    cell._style = st
+            for c in range(1, REMARK_COL + 1):
+                ws.cell(row=nr, column=c)._style = copy(style_map[old][c - 1])
 
     seq_by_model: Dict[str, int] = {}
     global_box_seq: Dict[str, int] = {}
@@ -2584,24 +2234,18 @@ def apply_assignments(
         global_box_seq[box_name] = global_seq_counter
         for old in rs:
             nr = old_to_new[old]
-            safe_set_cell(ws, nr, CAR_INFO_COL, display_model)
-            safe_set_cell(ws, nr, CAR_INFO_SEQ_COL, seq)
+            ws.cell(row=nr, column=CAR_INFO_COL, value=display_model)
+            ws.cell(row=nr, column=CAR_INFO_SEQ_COL, value=seq)
             cargo_new_rows.append(nr)
             box_seq_by_new_row[nr] = global_box_seq[box_name]
 
-    end_row = DATA_START_ROW + len(final_rows) - 1 if final_rows else DATA_START_ROW
-    fill_box_formula_cells(
-        ws,
-        cargo_new_rows,
-        box_seq_by_new_row,
-        summary_style_map,
-        formula_style_map,
-        data_end_row=end_row,
-    )
+    fill_box_formula_cells(ws, cargo_new_rows, box_seq_by_new_row, summary_style_map, formula_style_map)
 
     if ordered_rows:
         merge_box_formula_runs(ws, DATA_START_ROW, DATA_START_ROW + len(ordered_rows) - 1, 13, 23)
         merge_car_info_runs(ws, DATA_START_ROW, DATA_START_ROW + len(ordered_rows) - 1)
+
+    end_row = DATA_START_ROW + len(final_rows) - 1 if final_rows else DATA_START_ROW
 
     # FR cargo remark enrichment:
     # - 超宽: compare width against FR model-specific limit.
@@ -2632,39 +2276,20 @@ def apply_assignments(
                 continue
             labels: List[str] = [group_label]
             for r in mapped:
-                cell = ws.cell(row=r, column=REMARK_COL)
-                v = None
-                if isinstance(cell, MergedCell):
-                    for mr in ws.merged_cells.ranges:
-                        if mr.min_row <= r <= mr.max_row and mr.min_col <= REMARK_COL <= mr.max_col:
-                            v = ws.cell(row=mr.min_row, column=mr.min_col).value
-                            break
-                else:
-                    v = cell.value
+                v = ws.cell(row=r, column=REMARK_COL).value
                 if v is None:
                     continue
                 for p in str(v).replace("；", ";").split(";"):
                     p = p.strip()
                     if p and p not in labels:
                         labels.append(p)
-            text = "；".join(labels)
-            # Drop any existing remark merges covering these rows before re-merge / write.
-            for r in mapped:
-                _unmerge_cell(ws, r, REMARK_COL)
             if all(b - a == 1 for a, b in zip(mapped, mapped[1:])):
-                try:
-                    ws.merge_cells(
-                        start_row=mapped[0],
-                        start_column=REMARK_COL,
-                        end_row=mapped[-1],
-                        end_column=REMARK_COL,
-                    )
-                except Exception:
-                    pass
-                safe_set_cell(ws, mapped[0], REMARK_COL, text)
+                ws.merge_cells(start_row=mapped[0], start_column=REMARK_COL, end_row=mapped[-1], end_column=REMARK_COL)
+                ws.cell(row=mapped[0], column=REMARK_COL, value="；".join(labels))
             else:
+                text = "；".join(labels)
                 for r in mapped:
-                    safe_set_cell(ws, r, REMARK_COL, text)
+                    ws.cell(row=r, column=REMARK_COL, value=text)
 
     for col, s, e in preserve_merges:
         source_rows = [r for r in range(s, e + 1) if r in old_to_new]
@@ -2716,7 +2341,6 @@ def generate_outputs(
     enable_stack: bool = False,
     box_specs: List[BoxSpec] | None = None,
     size_safety_margin_mm: float | None = None,
-    opt_mode: str = OPT_MODE_BALANCED,
 ) -> List[Tuple[str, Path]]:
     """
     enable_stack: when True, vertical stacking is applied at unit-formation time
@@ -2725,13 +2349,7 @@ def generate_outputs(
 
     box_specs / size_safety_margin_mm: optional overrides for equipment dimensions
     and the uniform L/W/H safety margin deducted before hard constraints.
-
-    opt_mode: min_boxes | max_util | balanced | priority (custom mode objective).
     """
-    global _CURRENT_OPT_MODE
-    if opt_mode in (OPT_MODE_MIN_BOXES, OPT_MODE_MAX_UTIL, OPT_MODE_BALANCED, OPT_MODE_PRIORITY):
-        _CURRENT_OPT_MODE = opt_mode
-
     if box_specs is not None or size_safety_margin_mm is not None:
         apply_box_config(box_specs, size_safety_margin_mm)
 
@@ -2783,11 +2401,11 @@ def generate_outputs(
         apply_assignments(input_path, p, ass, merges or None)
         outputs.append((SCENARIO_LABELS["auto"], p))
     if scenario == "custom":
-        ass, early_stack = pack_custom(
-            items, custom_boxes or [], enable_stack=enable_stack, opt_mode=opt_mode
-        )
-        # Only user-selected types — do not silently append boards.
+        ass, early_stack = pack_custom(items, custom_boxes or [], enable_stack=enable_stack)
         allowed = [c for c in (custom_boxes or []) if c in BOX_RULES]
+        for b in BOARD_CODES:
+            if b not in allowed:
+                allowed.append(b)
         ass = enforce_all_items_assigned(ass, items, allowed_codes=allowed)
         ass = optimize_leftover_box_model(ass, items, allowed_codes=allowed)
         ass, post_tagged = apply_repack_merges(ass, items, allowed, enable_stack)
