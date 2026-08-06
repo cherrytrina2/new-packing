@@ -1631,34 +1631,45 @@ def repack_prioritize_merging_underfilled(
     return out
 
 
-def optimize_with_optional_boxes(units: List[Unit], rules: List[str]) -> Dict[int, str]:
+def optimize_with_optional_boxes(
+    units: List[Unit],
+    rules: List[str],
+    *,
+    respect_priority: bool = False,
+) -> Dict[int, str]:
+    """Pack with optional post-optimizations.
+
+    respect_priority=True (custom mode):
+      - Strictly follow ``rules`` order: fill type[0] first, leftovers to type[1], ...
+      - Do NOT drop higher-priority types (e.g. 20GP) just because pure 40HQ has fewer boxes.
+      - Underfilled merge still runs, but only within the same rule set/order.
+    """
     base = pack_by_rule_priority_mode(units, rules)
     best = global_backoff_optimize(units, rules, base)
     best_obj = assignment_objective(best, units)
 
-    # 20FR retention rule:
-    # 1) Compare box count first.
-    # 2) When box count ties, compare volume utilization.
-    # Keep 20FR when it has higher utilization under equal box count.
-    if "20FR" in rules and "40FR" in rules and assignment_uses_model(best, "20FR"):
-        rules_no_20fr = [r for r in rules if r != "20FR"]
-        base_no = pack_by_rule_priority_mode(units, rules_no_20fr)
-        cand_no = global_backoff_optimize(units, rules_no_20fr, base_no)
-        obj_no = assignment_objective(cand_no, units)
-        if should_replace_assignment(best, best_obj, cand_no, obj_no, units):
-            best, best_obj = cand_no, obj_no
+    if not respect_priority:
+        # 20FR retention rule (auto / scenario modes only):
+        # Keep 20FR when it does not worsen the global objective vs without 20FR.
+        if "20FR" in rules and "40FR" in rules and assignment_uses_model(best, "20FR"):
+            rules_no_20fr = [r for r in rules if r != "20FR"]
+            base_no = pack_by_rule_priority_mode(units, rules_no_20fr)
+            cand_no = global_backoff_optimize(units, rules_no_20fr, base_no)
+            obj_no = assignment_objective(cand_no, units)
+            if should_replace_assignment(best, best_obj, cand_no, obj_no, units):
+                best, best_obj = cand_no, obj_no
 
-    # 20GP is only kept when it reduces total box count vs path without 20GP.
-    if "20GP" in rules and assignment_uses_model(best, "20GP"):
-        rules_no_20gp = [r for r in rules if r != "20GP"]
-        base_no = pack_by_rule_priority_mode(units, rules_no_20gp)
-        cand_no = global_backoff_optimize(units, rules_no_20gp, base_no)
-        obj_no = assignment_objective(cand_no, units)
-        if should_replace_assignment(best, best_obj, cand_no, obj_no, units):
-            best, best_obj = cand_no, obj_no
+        # 20GP only kept when it improves objective vs path without 20GP.
+        # (This is what previously wiped 20GP when user put it first in custom mode.)
+        if "20GP" in rules and assignment_uses_model(best, "20GP"):
+            rules_no_20gp = [r for r in rules if r != "20GP"]
+            base_no = pack_by_rule_priority_mode(units, rules_no_20gp)
+            cand_no = global_backoff_optimize(units, rules_no_20gp, base_no)
+            obj_no = assignment_objective(cand_no, units)
+            if should_replace_assignment(best, best_obj, cand_no, obj_no, units):
+                best, best_obj = cand_no, obj_no
 
     # Re-pack iteratively when boxes are underfilled by length.
-    # In these rounds we bias strongly toward width-similar merging.
     for _ in range(UNDERFILLED_REPACK_MAX_ROUNDS):
         if not has_underfilled_boxes(best, units):
             break
@@ -2014,12 +2025,17 @@ def _priority_preference_score(assignments: Dict[int, str], priority_order: List
 
 
 def pack_custom(items: List[Item], box_codes: List[str], enable_stack: bool = False) -> Tuple[Dict[int, str], List[List[int]]]:
-    """Custom mode: only selected box types; primary goal = max utilization (min boxes).
+    """Custom mode: only selected box types, strict priority order.
 
-    Priority order from the UI is a soft preference:
-    - We try several packing orders (user priority, reverse, large-first, small-first)
-    - Pick the assignment with best objective (box count → balance → volume util → leftover)
-    - On near-ties, prefer solutions that use higher-priority types more.
+    Priority is HARD:
+      1) Fill as many units as possible into the first listed type
+      2) Leftovers go to the second type, then third, ...
+      3) Within each type, still pack for high length/volume fill
+
+    Previously a multi-start search + "drop 20GP if pure 40HQ has fewer boxes"
+    overrode user order (e.g. 20GP,40HQ → all 40HQ). Those are disabled here
+    via respect_priority=True.
+
     Boards are NOT auto-appended unless the user selected them.
     """
     valid = [c for c in box_codes if c in BOX_RULES]
@@ -2029,43 +2045,8 @@ def pack_custom(items: List[Item], box_codes: List[str], enable_stack: bool = Fa
     units, stack_merges = build_units_with_optional_stack(
         items, enable_stack=enable_stack, allowed_codes=uniq
     )
-
-    # Candidate rule orderings — multi-start search for better utilization.
-    orderings: List[List[str]] = []
-    orderings.append(list(uniq))  # user priority
-    if len(uniq) > 1:
-        orderings.append(list(reversed(uniq)))
-        orderings.append(_capacity_sorted_codes(uniq, descending=True))   # large first
-        orderings.append(_capacity_sorted_codes(uniq, descending=False))  # small first
-
-    # Deduplicate orderings
-    seen = set()
-    unique_orderings: List[List[str]] = []
-    for ord_ in orderings:
-        key = tuple(ord_)
-        if key not in seen:
-            seen.add(key)
-            unique_orderings.append(ord_)
-
-    best: Dict[int, str] | None = None
-    best_obj: Tuple[int, float, float, float] | None = None
-    best_pref = float("inf")
-
-    for ord_ in unique_orderings:
-        cand = optimize_with_optional_boxes(units, ord_)
-        obj = assignment_objective(cand, units)
-        pref = _priority_preference_score(cand, uniq)
-        if best is None or best_obj is None:
-            best, best_obj, best_pref = cand, obj, pref
-            continue
-        if obj < best_obj:
-            best, best_obj, best_pref = cand, obj, pref
-        elif obj == best_obj and pref < best_pref:
-            # Same utilization metrics → prefer higher-priority box mix
-            best, best_obj, best_pref = cand, obj, pref
-
-    assert best is not None
-    return best, stack_merges
+    assignments = optimize_with_optional_boxes(units, uniq, respect_priority=True)
+    return assignments, stack_merges
 
 
 def pack_auto(items: List[Item], use_hq: bool = False, enable_stack: bool = False) -> Tuple[Dict[int, str], List[List[int]]]:
