@@ -1636,48 +1636,45 @@ def optimize_with_optional_boxes(
     rules: List[str],
     *,
     respect_priority: bool = False,
+    opt_mode: str | None = None,
 ) -> Dict[int, str]:
     """Pack with optional post-optimizations.
 
-    respect_priority=True (custom mode):
+    respect_priority=True:
       - Strictly follow ``rules`` order: fill type[0] first, leftovers to type[1], ...
-      - Do NOT drop higher-priority types (e.g. 20GP) just because pure 40HQ has fewer boxes.
-      - Underfilled merge still runs, but only within the same rule set/order.
+      - Do NOT drop listed types just because another mix has fewer boxes.
+    opt_mode: min_boxes | max_util | balanced | priority — drives comparison.
     """
+    om = opt_mode or _CURRENT_OPT_MODE
     base = pack_by_rule_priority_mode(units, rules)
-    best = global_backoff_optimize(units, rules, base)
-    best_obj = assignment_objective(best, units)
+    best = global_backoff_optimize(units, rules, base, om)
+    best_obj = assignment_objective(best, units, om)
 
     if not respect_priority:
-        # 20FR retention rule (auto / scenario modes only):
-        # Keep 20FR when it does not worsen the global objective vs without 20FR.
         if "20FR" in rules and "40FR" in rules and assignment_uses_model(best, "20FR"):
             rules_no_20fr = [r for r in rules if r != "20FR"]
             base_no = pack_by_rule_priority_mode(units, rules_no_20fr)
-            cand_no = global_backoff_optimize(units, rules_no_20fr, base_no)
-            obj_no = assignment_objective(cand_no, units)
-            if should_replace_assignment(best, best_obj, cand_no, obj_no, units):
+            cand_no = global_backoff_optimize(units, rules_no_20fr, base_no, om)
+            obj_no = assignment_objective(cand_no, units, om)
+            if should_replace_assignment(best, best_obj, cand_no, obj_no, units, om):
                 best, best_obj = cand_no, obj_no
 
-        # 20GP only kept when it improves objective vs path without 20GP.
-        # (This is what previously wiped 20GP when user put it first in custom mode.)
         if "20GP" in rules and assignment_uses_model(best, "20GP"):
             rules_no_20gp = [r for r in rules if r != "20GP"]
             base_no = pack_by_rule_priority_mode(units, rules_no_20gp)
-            cand_no = global_backoff_optimize(units, rules_no_20gp, base_no)
-            obj_no = assignment_objective(cand_no, units)
-            if should_replace_assignment(best, best_obj, cand_no, obj_no, units):
+            cand_no = global_backoff_optimize(units, rules_no_20gp, base_no, om)
+            obj_no = assignment_objective(cand_no, units, om)
+            if should_replace_assignment(best, best_obj, cand_no, obj_no, units, om):
                 best, best_obj = cand_no, obj_no
 
-    # Re-pack iteratively when boxes are underfilled by length.
     for _ in range(UNDERFILLED_REPACK_MAX_ROUNDS):
         if not has_underfilled_boxes(best, units):
             break
         cand_merge = repack_prioritize_merging_underfilled(units, rules, best)
         cand_merge = consolidate_tiny_underfilled_boxes(cand_merge, units)
-        cand_merge = global_backoff_optimize(units, rules, cand_merge)
-        obj_merge = assignment_objective(cand_merge, units)
-        if should_replace_assignment(best, best_obj, cand_merge, obj_merge, units):
+        cand_merge = global_backoff_optimize(units, rules, cand_merge, om)
+        obj_merge = assignment_objective(cand_merge, units, om)
+        if should_replace_assignment(best, best_obj, cand_merge, obj_merge, units, om):
             best, best_obj = cand_merge, obj_merge
         else:
             break
@@ -1699,37 +1696,100 @@ def box_volume_capacity(model: str) -> float:
     return max(0.0, rule.length_cap) * max(0.0, eff_width) * max(0.0, max_h)
 
 
-def assignment_objective(assignments: Dict[int, str], units: List[Unit]) -> Tuple[int, float, float, float]:
+# Optimization modes for packing (especially custom multi-type).
+OPT_MODE_MIN_BOXES = "min_boxes"      # fewest containers first (freight $)
+OPT_MODE_MAX_UTIL = "max_util"        # highest volume fill rate first
+OPT_MODE_BALANCED = "balanced"        # minimize total hired capacity (box count × size trade-off)
+OPT_MODE_PRIORITY = "priority"        # hard user priority order
+
+# Thread-local-ish default used by helpers when not passed explicitly.
+_CURRENT_OPT_MODE: str = OPT_MODE_BALANCED
+
+
+def assignment_metrics(assignments: Dict[int, str], units: List[Unit]) -> Dict[str, float]:
+    """Compute packing quality metrics used by all objective modes."""
+    empty = {
+        "box_count": 10**9,
+        "balance_excess": 10**9,
+        "util_penalty": 10**9,
+        "leftover": 10**9,
+        "capacity_volume": 10**9,
+        "cargo_volume": 0.0,
+        "mean_length_util": 0.0,
+    }
     if not assignments:
-        return (10**9, 10**9, 10**9, 10**9)
+        return empty
     box_units = box_units_from_assignments(assignments, units)
-    if not box_units or len(box_units) == 0:
-        return (10**9, 10**9, 10**9, 10**9)
+    if not box_units:
+        return empty
     assigned_unit_count = sum(len(us) for us in box_units.values())
     if assigned_unit_count < len(units):
-        return (10**9, 10**9, 10**9, 10**9)
+        return empty
 
     total_leftover = 0.0
     total_balance_excess = 0.0
     total_cargo_volume = 0.0
     total_box_capacity_volume = 0.0
+    length_util_sum = 0.0
     for b, us in box_units.items():
         model = b.split("-", 1)[0]
         rule = BOX_RULES.get(model)
         if rule is None:
             continue
-        total_leftover += max(0.0, rule.length_cap - used_length_of_units(us))
-        total_cargo_volume += sum(max(0.0, u.length) * max(0.0, u.width) * max(0.0, u.height) for u in us)
+        used_len = used_length_of_units(us)
+        total_leftover += max(0.0, rule.length_cap - used_len)
+        if rule.length_cap > 0:
+            length_util_sum += min(1.0, used_len / rule.length_cap)
+        total_cargo_volume += sum(
+            max(0.0, u.length) * max(0.0, u.width) * max(0.0, u.height) for u in us
+        )
         total_box_capacity_volume += box_volume_capacity(model)
         if any(u.weight >= BIG_PIECE_WEIGHT for u in us):
             total_balance_excess += max(0.0, estimate_side_diff(us) - SIDE_WEIGHT_DIFF_LIMIT)
-    utilization_penalty = (total_box_capacity_volume / total_cargo_volume) if total_cargo_volume > 0 else 10**9
-    # Objective order:
-    # 1) minimize box count
-    # 2) minimize side-balance excess
-    # 3) maximize volume utilization (implemented as minimizing capacity/cargo ratio)
-    # 4) minimize leftover length
-    return (len(box_units), total_balance_excess, utilization_penalty, total_leftover)
+    n_boxes = len(box_units)
+    util_penalty = (
+        (total_box_capacity_volume / total_cargo_volume) if total_cargo_volume > 0 else 10**9
+    )
+    mean_length_util = length_util_sum / n_boxes if n_boxes else 0.0
+    return {
+        "box_count": float(n_boxes),
+        "balance_excess": total_balance_excess,
+        "util_penalty": util_penalty,
+        "leftover": total_leftover,
+        "capacity_volume": total_box_capacity_volume,
+        "cargo_volume": total_cargo_volume,
+        "mean_length_util": mean_length_util,
+    }
+
+
+def assignment_objective(
+    assignments: Dict[int, str],
+    units: List[Unit],
+    opt_mode: str | None = None,
+) -> Tuple:
+    """Lexicographic objective; lower tuple is better.
+
+    Modes (industry-aligned):
+      min_boxes  – box count → balance → util → leftover
+      max_util   – util → box count → balance → leftover
+      balanced   – total hired capacity → box count → util → leftover
+                   (trades a few more small boxes vs oversized empty large boxes)
+      priority   – same as min_boxes (order enforced elsewhere)
+    """
+    mode = opt_mode or _CURRENT_OPT_MODE
+    m = assignment_metrics(assignments, units)
+    bc = m["box_count"]
+    bal = m["balance_excess"]
+    util = m["util_penalty"]
+    left = m["leftover"]
+    cap = m["capacity_volume"]
+
+    if mode == OPT_MODE_MAX_UTIL:
+        return (util, bc, bal, left)
+    if mode == OPT_MODE_BALANCED:
+        return (cap, bc, util, bal, left)
+    # min_boxes / priority / default
+    return (bc, bal, util, left)
 
 
 def assignment_box_volume(assignments: Dict[int, str], units: List[Unit]) -> float:
@@ -1745,39 +1805,45 @@ def assignment_box_volume(assignments: Dict[int, str], units: List[Unit]) -> flo
 
 def should_replace_assignment(
     current: Dict[int, str],
-    current_obj: Tuple[int, float, float, float],
+    current_obj: Tuple,
     candidate: Dict[int, str],
-    candidate_obj: Tuple[int, float, float, float],
+    candidate_obj: Tuple,
     units: List[Unit],
+    opt_mode: str | None = None,
 ) -> bool:
-    # Unified rule across scenarios:
-    # 1) Fewer boxes wins.
-    # 2) If box count ties, choose the one with higher packing box-volume.
-    # 3) If still tied, fall back to original objective tuple.
-    if candidate_obj[0] < current_obj[0]:
+    """Accept candidate when its objective tuple is strictly better."""
+    mode = opt_mode or _CURRENT_OPT_MODE
+    if candidate_obj < current_obj:
         return True
-    if candidate_obj[0] > current_obj[0]:
+    if candidate_obj > current_obj:
         return False
-
-    cand_vol = assignment_box_volume(candidate, units)
-    cur_vol = assignment_box_volume(current, units)
-    if cand_vol > cur_vol + 1e-6:
+    # Tie on primary objective: prefer higher mean length utilization
+    cm = assignment_metrics(candidate, units)
+    cur = assignment_metrics(current, units)
+    if cm["mean_length_util"] > cur["mean_length_util"] + 1e-6:
         return True
-    if cand_vol < cur_vol - 1e-6:
-        return False
+    if mode == OPT_MODE_MIN_BOXES:
+        # Prefer smaller total capacity when counts equal (tighter fit)
+        if cm["capacity_volume"] < cur["capacity_volume"] - 1e-6:
+            return True
+    return False
 
-    return candidate_obj < current_obj
 
-
-def global_backoff_optimize(units: List[Unit], rule_codes: List[str], base: Dict[int, str]) -> Dict[int, str]:
+def global_backoff_optimize(
+    units: List[Unit],
+    rule_codes: List[str],
+    base: Dict[int, str],
+    opt_mode: str | None = None,
+) -> Dict[int, str]:
+    om = opt_mode or _CURRENT_OPT_MODE
     best = base.copy()
-    best_obj = assignment_objective(best, units)
+    best_obj = assignment_objective(best, units, om)
     strategies: List[Tuple[str, int]] = [("length", 0), ("weight", 0), ("hybrid", 0), ("width", 0)]
     strategies.extend([("random", i) for i in range(1, 9)])
     for mode, seed in strategies:
         cand = pack_by_rule_priority_mode(units, rule_codes, order_mode=mode, random_seed=seed)
-        obj = assignment_objective(cand, units)
-        if should_replace_assignment(best, best_obj, cand, obj, units):
+        obj = assignment_objective(cand, units, om)
+        if should_replace_assignment(best, best_obj, cand, obj, units, om):
             best = cand
             best_obj = obj
     return best
@@ -2024,29 +2090,73 @@ def _priority_preference_score(assignments: Dict[int, str], priority_order: List
     return score
 
 
-def pack_custom(items: List[Item], box_codes: List[str], enable_stack: bool = False) -> Tuple[Dict[int, str], List[List[int]]]:
-    """Custom mode: only selected box types, strict priority order.
+def pack_custom(
+    items: List[Item],
+    box_codes: List[str],
+    enable_stack: bool = False,
+    opt_mode: str = OPT_MODE_BALANCED,
+) -> Tuple[Dict[int, str], List[List[int]]]:
+    """Custom mode: only selected box types.
 
-    Priority is HARD:
-      1) Fill as many units as possible into the first listed type
-      2) Leftovers go to the second type, then third, ...
-      3) Within each type, still pack for high length/volume fill
-
-    Previously a multi-start search + "drop 20GP if pure 40HQ has fewer boxes"
-    overrode user order (e.g. 20GP,40HQ → all 40HQ). Those are disabled here
-    via respect_priority=True.
+    opt_mode:
+      priority  – hard order: fill type[0] first, then type[1], ...
+      min_boxes – multi-start search; fewest containers wins
+      max_util  – multi-start; highest volume fill rate wins
+      balanced  – multi-start; minimize total hired capacity (count × size trade-off)
 
     Boards are NOT auto-appended unless the user selected them.
     """
+    global _CURRENT_OPT_MODE
     valid = [c for c in box_codes if c in BOX_RULES]
     if not valid:
         raise ValueError("自定义模式下请至少选择一个有效箱型")
-    uniq = list(dict.fromkeys(valid))  # preserve user priority order
+    uniq = list(dict.fromkeys(valid))
     units, stack_merges = build_units_with_optional_stack(
         items, enable_stack=enable_stack, allowed_codes=uniq
     )
-    assignments = optimize_with_optional_boxes(units, uniq, respect_priority=True)
-    return assignments, stack_merges
+
+    mode = opt_mode if opt_mode in (
+        OPT_MODE_MIN_BOXES, OPT_MODE_MAX_UTIL, OPT_MODE_BALANCED, OPT_MODE_PRIORITY
+    ) else OPT_MODE_BALANCED
+    _CURRENT_OPT_MODE = mode
+
+    if mode == OPT_MODE_PRIORITY:
+        assignments = optimize_with_optional_boxes(
+            units, uniq, respect_priority=True, opt_mode=mode
+        )
+        return assignments, stack_merges
+
+    # Multi-start: user order, reverse, large-first, small-first
+    orderings: List[List[str]] = [list(uniq)]
+    if len(uniq) > 1:
+        orderings.append(list(reversed(uniq)))
+        orderings.append(_capacity_sorted_codes(uniq, descending=True))
+        orderings.append(_capacity_sorted_codes(uniq, descending=False))
+    seen = set()
+    unique_orderings: List[List[str]] = []
+    for ord_ in orderings:
+        key = tuple(ord_)
+        if key not in seen:
+            seen.add(key)
+            unique_orderings.append(ord_)
+
+    best: Dict[int, str] | None = None
+    best_obj: Tuple | None = None
+    # Allow dropping a type only for min_boxes (freight-driven)
+    respect = mode != OPT_MODE_MIN_BOXES
+
+    for ord_ in unique_orderings:
+        cand = optimize_with_optional_boxes(
+            units, ord_, respect_priority=respect, opt_mode=mode
+        )
+        obj = assignment_objective(cand, units, mode)
+        if best is None or best_obj is None or should_replace_assignment(
+            best, best_obj, cand, obj, units, mode
+        ):
+            best, best_obj = cand, obj
+
+    assert best is not None
+    return best, stack_merges
 
 
 def pack_auto(items: List[Item], use_hq: bool = False, enable_stack: bool = False) -> Tuple[Dict[int, str], List[List[int]]]:
@@ -2606,6 +2716,7 @@ def generate_outputs(
     enable_stack: bool = False,
     box_specs: List[BoxSpec] | None = None,
     size_safety_margin_mm: float | None = None,
+    opt_mode: str = OPT_MODE_BALANCED,
 ) -> List[Tuple[str, Path]]:
     """
     enable_stack: when True, vertical stacking is applied at unit-formation time
@@ -2614,7 +2725,13 @@ def generate_outputs(
 
     box_specs / size_safety_margin_mm: optional overrides for equipment dimensions
     and the uniform L/W/H safety margin deducted before hard constraints.
+
+    opt_mode: min_boxes | max_util | balanced | priority (custom mode objective).
     """
+    global _CURRENT_OPT_MODE
+    if opt_mode in (OPT_MODE_MIN_BOXES, OPT_MODE_MAX_UTIL, OPT_MODE_BALANCED, OPT_MODE_PRIORITY):
+        _CURRENT_OPT_MODE = opt_mode
+
     if box_specs is not None or size_safety_margin_mm is not None:
         apply_box_config(box_specs, size_safety_margin_mm)
 
@@ -2666,11 +2783,11 @@ def generate_outputs(
         apply_assignments(input_path, p, ass, merges or None)
         outputs.append((SCENARIO_LABELS["auto"], p))
     if scenario == "custom":
-        ass, early_stack = pack_custom(items, custom_boxes or [], enable_stack=enable_stack)
+        ass, early_stack = pack_custom(
+            items, custom_boxes or [], enable_stack=enable_stack, opt_mode=opt_mode
+        )
+        # Only user-selected types — do not silently append boards.
         allowed = [c for c in (custom_boxes or []) if c in BOX_RULES]
-        for b in BOARD_CODES:
-            if b not in allowed:
-                allowed.append(b)
         ass = enforce_all_items_assigned(ass, items, allowed_codes=allowed)
         ass = optimize_leftover_box_model(ass, items, allowed_codes=allowed)
         ass, post_tagged = apply_repack_merges(ass, items, allowed, enable_stack)
